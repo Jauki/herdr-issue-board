@@ -19,27 +19,32 @@ export async function listWorktrees(repoCwd: string): Promise<Worktree[]> {
 	return trees;
 }
 
-/** Newest worktree on a `<prefix>` branch, preferring one whose branch ends with the selection range. */
+/** Newest worktree on a `<prefix>` branch, preferring one whose branch is for this selection range. */
 export function pickPrototypeWorktree(trees: Worktree[], prefix: string, range: string): Worktree | undefined {
 	const candidates = trees.filter(t => t.branch.startsWith(prefix));
-	return candidates.find(t => t.branch.endsWith(range)) ?? candidates[candidates.length - 1];
+	const tail = (t: Worktree) => t.branch.slice(prefix.length);
+	return candidates.find(t => tail(t) === range || tail(t).startsWith(`${range}-`)) ?? candidates[candidates.length - 1];
 }
 
 export type Artifact = { rel: string; abs: string; image: boolean };
 
-/** Collects hand-off files (screenshots + the prototype itself) from the worktree's prototype dir. */
-export async function findArtifacts(dir: string, globs: string[]): Promise<Artifact[]> {
+/**
+ * Collects hand-off files (screenshots + the prototype itself) from `<repoRoot>/<dir>`.
+ * `rel` is repo-relative, so `git add` and raw-URL links use the same path.
+ */
+export async function findArtifacts(repoRoot: string, dir: string, globs: string[]): Promise<Artifact[]> {
+	const root = join(repoRoot, dir);
 	const found = new Set<string>();
 	for (const pattern of globs) {
 		try {
-			for (const rel of new Bun.Glob(pattern).scanSync({ cwd: dir, onlyFiles: true })) found.add(rel);
+			for (const rel of new Bun.Glob(pattern).scanSync({ cwd: root, onlyFiles: true })) found.add(rel);
 		} catch {}
 	}
 	return [...found]
 		.filter(rel => rel.split("/").every(part => part !== "node_modules" && !part.startsWith(".")))
 		.sort()
 		.slice(0, 60)
-		.map(rel => ({ rel, abs: join(dir, rel), image: IMAGE.test(rel) }));
+		.map(rel => ({ rel: join(dir, rel), abs: join(root, rel), image: IMAGE.test(rel) }));
 }
 
 /** Stages, commits (only when dirty) and pushes the given paths on the worktree's branch. */

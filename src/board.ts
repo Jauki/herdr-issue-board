@@ -834,7 +834,7 @@ function attachPrototype() {
 		const trees = await proto.listWorktrees(repoCwd);
 		const wt = proto.pickPrototypeWorktree(trees, config.prototype.branchPrefix, range);
 		if (!wt) throw new Error(`no worktree on a "${config.prototype.branchPrefix}" branch in this repo`);
-		const artifacts = await proto.findArtifacts(join(wt.path, config.prototype.dir), config.prototype.artifactGlobs);
+		const artifacts = await proto.findArtifacts(wt.path, config.prototype.dir, config.prototype.artifactGlobs);
 		if (!artifacts.length) throw new Error(`no artefacts under ${config.prototype.dir}/ in ${wt.path}`);
 		await proto.publishArtifacts(wt, artifacts.map(a => a.rel), `prototype: #${range} artefacts`);
 		const repoTarget = await gh.repoName(repoCwd);
