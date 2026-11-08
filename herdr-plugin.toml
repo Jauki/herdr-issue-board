@@ -1,8 +1,8 @@
 id = "jauki.issue-board"
 name = "Issue Board"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
-description = "Kanban board of the focused repo's GitHub issues; hand tickets to coding agents"
+description = "Kanban board of the focused repo's GitHub issues; multi-select tickets, drive agent skills from a slash palette, hand prototypes back to tickets"
 platforms = ["linux", "macos"]
 
 # Bind with:  [[keys.command]] key = "prefix+i"  type = "plugin_action"  command = "jauki.issue-board.open"

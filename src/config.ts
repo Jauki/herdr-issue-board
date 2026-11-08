@@ -3,12 +3,30 @@ import { join } from "node:path";
 /** A board column: open issues carrying `label` land here (first matching column wins). */
 export type ColumnSpec = { title: string; label: string };
 
+/** Where `/{skill}` runs put their work and what the board publishes back onto the tickets. */
+export type PrototypeConfig = {
+	/** Skill whose runs get `prompts.prototypeExtra` appended and whose artefacts `/attach` publishes. */
+	skill: string;
+	/** Branch namespace for `/{skill}` worktrees; `/attach` matches worktrees on it. */
+	branchPrefix: string;
+	/** Directory inside the worktree where the agent leaves the prototype and its screenshots. */
+	dir: string;
+	/** Globs, relative to `dir`, of the files published to the tickets. */
+	artifactGlobs: string[];
+};
+
 export type Config = {
 	/** herdr agent kind started for new tickets (`herdr agent start --kind`). */
 	agent: string;
 	columns: ColumnSpec[];
-	/** Templates; placeholders: {number} {title} {repo} {url} {branch}. */
-	prompts: { implement: string; refine: string };
+	/**
+	 * Templates. `implement`/`refine` placeholders: {number} {title} {repo} {url} {branch}.
+	 * `skill` placeholders: {skill} {skillPath} {count} {repo} {tickets} {list} {branch} {range} {extra}.
+	 */
+	prompts: { implement: string; refine: string; skill: string; prototypeExtra: string };
+	/** Skill roots scanned for SKILL.md files; defaults to the shared agent skill dirs. */
+	skillDirs?: string[];
+	prototype: PrototypeConfig;
 };
 
 const DEFAULTS: Config = {
@@ -27,10 +45,25 @@ const DEFAULTS: Config = {
 			'Help me refine GitHub issue #{number} in {repo}: "{title}" ({url}). ' +
 			"Read it with `gh issue view {number} --comments`, ask me what should change, " +
 			"then update it with `gh issue edit {number}`. Do not implement it.",
+		skill:
+			'Use the "{skill}" skill (it lives at {skillPath}) for {count} GitHub tickets in {repo}: {tickets}.\n' +
+			"\n{list}\n" +
+			"\nRead each ticket with `gh issue view <n> --comments` before starting. You are in a fresh git worktree on " +
+			"branch `{branch}` — leave main untouched and keep every artefact on this branch.{extra}",
+		prototypeExtra:
+			"\n\nWhen the prototype is ready, capture it: save one full-page screenshot per variant as PNG under " +
+			"`prototype/screenshots/` in this worktree, named after the variant, and commit them on this branch. " +
+			"That way the issue board can post them on the tickets with `/attach` and the implementing agent knows exactly what to build.",
+	},
+	prototype: {
+		skill: "prototype",
+		branchPrefix: "slash/",
+		dir: "prototype",
+		artifactGlobs: ["**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.webp", "**/*.gif", "**/*.html"],
 	},
 };
 
-/** Loads `$HERDR_PLUGIN_CONFIG_DIR/config.json` over the defaults; `columns` replaces, `prompts` merges. */
+/** Loads `$HERDR_PLUGIN_CONFIG_DIR/config.json` over the defaults; `columns` replaces, the rest merges. */
 export async function loadConfig(): Promise<Config> {
 	const dir = process.env.HERDR_PLUGIN_CONFIG_DIR;
 	if (!dir) return DEFAULTS;
@@ -41,6 +74,8 @@ export async function loadConfig(): Promise<Config> {
 		agent: user.agent ?? DEFAULTS.agent,
 		columns: user.columns ?? DEFAULTS.columns,
 		prompts: { ...DEFAULTS.prompts, ...user.prompts },
+		skillDirs: user.skillDirs ?? DEFAULTS.skillDirs,
+		prototype: { ...DEFAULTS.prototype, ...user.prototype },
 	};
 }
 

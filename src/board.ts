@@ -1,8 +1,14 @@
 // Kanban board of a repo's open GitHub issues, rendered as a full-screen terminal app inside a herdr pane.
 // Columns come from labels (config.ts). Right-click or `m` on a card opens actions that hand the ticket to agents.
+import { join } from "node:path";
 import { type ColumnSpec, type Config, fill, loadConfig } from "./config";
 import * as gh from "./github";
 import * as hd from "./herdr";
+import { copyToClipboard } from "./proc";
+import * as proto from "./prototype";
+import { ago, blocksToMarkdown, buildReport, type Block, reportPrompt } from "./report";
+import { parseSelectionSpec, rangeLabel } from "./selection";
+import { discoverSkills, type Skill } from "./skills";
 
 const repoCwd = process.env.ISSUE_BOARD_CWD ?? process.cwd();
 const originPane = process.env.ISSUE_BOARD_ORIGIN_PANE;
@@ -96,13 +102,6 @@ const slug = (s: string) =>
 		.slice(0, 40)
 		.replace(/-$/, "");
 
-function ago(iso: string): string {
-	const s = (Date.now() - Date.parse(iso)) / 1000;
-	if (s < 3600) return `${Math.max(1, Math.round(s / 60))}m`;
-	if (s < 86400) return `${Math.round(s / 3600)}h`;
-	return `${Math.round(s / 86400)}d`;
-}
-
 // ── state ───────────────────────────────────────────────────────────────────
 
 type Column = { spec: ColumnSpec | null; title: string; issues: gh.Issue[]; scroll: number };
@@ -112,7 +111,7 @@ type MenuItem = {
 	run?: () => unknown;
 	submenu?: () => MenuItem[] | Promise<MenuItem[]>;
 };
-type Menu = { title: string; items: MenuItem[]; index: number; x: number; y: number; parent: Menu | null };
+type Menu = { title: string; items: MenuItem[]; index: number; offset: number; x: number; y: number; parent: Menu | null };
 type Detail = { issue: gh.Issue; data: gh.IssueDetail | null; error: string | null; scroll: number };
 type Rect = { x0: number; y0: number; x1: number; y1: number };
 
@@ -129,6 +128,12 @@ let detail: Detail | null = null;
 let agents: hd.AgentInfo[] = [];
 let status: { text: string; color: number | null } = { text: "Loading issues…", color: null };
 let busy = false;
+/** Multi-selected ticket numbers (survives column moves and reloads). */
+let selected = new Set<number>();
+let skills: Skill[] = [];
+let reportView: { blocks: Block[]; scroll: number; skill?: Skill; issues: gh.Issue[]; repo: string } | null = null;
+/** Inline one-line text prompt shown in the status row while active. */
+let input: { label: string; buffer: string; apply: (text: string) => void } | null = null;
 
 // Hit-test tables rebuilt every render (0-based screen cells).
 let cardHits: (Rect & { col: number; row: number })[] = [];
@@ -188,7 +193,9 @@ const GAP = 1;
 const MIN_COL_W = 26;
 const BODY_TOP = 3;
 
-function layout() {
+export type Layout = { W: number; H: number; visible: number; cw: number; bodyH: number; perCol: number };
+
+function layout(): Layout {
 	const W = process.stdout.columns ?? 80;
 	const H = process.stdout.rows ?? 24;
 	const n = Math.max(1, columns.length);
@@ -216,7 +223,7 @@ function headerLine(W: number, left: string, right: string): string {
 	return bold(left) + " ".repeat(Math.max(1, W - width(left) - width(truncate(right, room)))) + dim(truncate(right, room));
 }
 
-function cardLines(issue: gh.Issue, cw: number, selected: boolean): string[] {
+function cardLines(issue: gh.Issue, cw: number, cursor: boolean, marked: boolean): string[] {
 	const inner = cw - 2;
 	const head = `#${issue.number} `;
 	const wrapped = wrap(head + clean(issue.title), inner);
@@ -236,14 +243,16 @@ function cardLines(issue: gh.Issue, cw: number, selected: boolean): string[] {
 	].join(" · ");
 	const line3 = (agent ? fg(statusColor(agent.status), badge) : "") + dim(fit(meta, inner - width(badge)));
 
-	const pre = selected ? INV : "";
-	return [line1, fit(t2, inner), line3].map(l => `${pre} ${l}${pre} ${RESET}`);
+	const pre = cursor ? INV : "";
+	const mark = marked ? fg(MAGENTA, "▌") : " ";
+	return [line1, fit(t2, inner), line3].map(l => `${pre}${mark} ${l}${pre} ${RESET}`);
 }
 
-function renderBoard(L: ReturnType<typeof layout>, rows: string[]) {
+function renderBoard(L: Layout, rows: string[]) {
 	const { W, cw, visible, bodyH, perCol } = L;
-	const right = "click/⏎ details · right-click/m actions · i implement · r refresh · q quit";
-	rows[0] = headerLine(W, ` ${repo || "…"} · ${issues.length} open`, right);
+	const right = "space select · J/K extend · / slash · ⏎ details · m actions · r refresh · q quit";
+	const picked = selected.size ? ` · ${selected.size} selected` : "";
+	rows[0] = headerLine(W, ` ${repo || "…"} · ${issues.length} open${picked}`, right);
 
 	const shown = columns.slice(colOffset, colOffset + visible);
 	const sep = dim("│");
@@ -268,7 +277,7 @@ function renderBoard(L: ReturnType<typeof layout>, rows: string[]) {
 			if (!issue) break;
 			const y0 = BODY_TOP + lines.length;
 			cardHits.push({ x0, x1: x0 + cw - 1, y0, y1: y0 + CARD_H - 1, col: ci, row: r });
-			lines.push(...cardLines(issue, cw, ci === selCol && r === selRow));
+			lines.push(...cardLines(issue, cw, ci === selCol && r === selRow, selected.has(issue.number)));
 			lines.push(" ".repeat(cw));
 		}
 		bodies.push(lines);
@@ -291,7 +300,7 @@ function detailLines(d: Detail, w: number): string[] {
 	return out;
 }
 
-function renderDetail(L: ReturnType<typeof layout>, rows: string[]) {
+function renderDetail(L: Layout, rows: string[]) {
 	const d = detail as Detail;
 	const { W, bodyH } = L;
 	const right = "esc back · right-click/m actions · o browser · j/k scroll";
@@ -304,10 +313,14 @@ function renderDetail(L: ReturnType<typeof layout>, rows: string[]) {
 	for (let y = 0; y < bodyH; y++) rows[BODY_TOP + y] = ` ${lines[d.scroll + y] ?? ""}`;
 }
 
-function renderMenu(m: Menu, L: ReturnType<typeof layout>): string {
+function renderMenu(m: Menu, L: Layout): string {
 	const labels = m.items.map(it => it.label + (it.submenu ? "  ›" : ""));
 	const w = clamp(Math.max(width(m.title) + 6, ...labels.map(l => width(l) + 4)), 10, L.W);
-	const h = m.items.length + 2;
+	const h = Math.min(m.items.length, Math.max(1, L.H - 2)) + 2;
+	const shown = h - 2;
+	if (m.index < m.offset) m.offset = m.index;
+	if (m.index >= m.offset + shown) m.offset = m.index - shown + 1;
+	m.offset = clamp(m.offset, 0, Math.max(0, m.items.length - shown));
 	const x = clamp(m.x, 0, L.W - w);
 	const y = clamp(m.y, 0, Math.max(0, L.H - h));
 	m.x = x;
@@ -315,14 +328,18 @@ function renderMenu(m: Menu, L: ReturnType<typeof layout>): string {
 	menuRect = { x0: x, y0: y, x1: x + w - 1, y1: y + h - 1 };
 	menuItemRows = [];
 	const at = (row: number) => `\x1b[${row + 1};${x + 1}H`;
-	const titleText = truncate(` ${m.title} `, w - 4);
+	const counter = m.items.length > shown ? ` ${m.index + 1}/${m.items.length}` : "";
+	const titleText = truncate(` ${m.title}${counter} `, w - 4);
 	let out = `${at(y)}${RESET}┌─${bold(titleText)}${"─".repeat(Math.max(0, w - 3 - width(titleText)))}┐`;
-	m.items.forEach((it, i) => {
-		const text = fit(` ${labels[i]}`, w - 2);
-		const styled = it.disabled ? dim(text) : i === m.index ? `${INV}${text}${RESET}` : text;
+	for (let i = 0; i < shown; i++) {
+		const index = m.offset + i;
+		const item = m.items[index];
+		if (!item) break;
+		const text = fit(` ${labels[index]}`, w - 2);
+		const styled = item.disabled ? dim(text) : index === m.index ? `${INV}${text}${RESET}` : text;
 		out += `${at(y + 1 + i)}${RESET}│${styled}│`;
-		menuItemRows.push({ y: y + 1 + i, index: i });
-	});
+		menuItemRows.push({ y: y + 1 + i, index });
+	}
 	out += `${at(y + h - 1)}${RESET}└${"─".repeat(w - 2)}┘`;
 	return out;
 }
@@ -335,11 +352,16 @@ function render() {
 	titleHits = [];
 	menuRect = null;
 	menuItemRows = [];
-	if (detail) renderDetail(L, rows);
+	if (reportView) renderReport(L, rows);
+	else if (detail) renderDetail(L, rows);
 	else renderBoard(L, rows);
-	const spin = busy ? "⠿ " : "";
-	const text = fit(` ${spin}${status.text}`, L.W);
-	rows[L.H - 1] = status.color ? fg(status.color, text) : dim(text);
+	if (input) {
+		rows[L.H - 1] = fg(CYAN, fit(` ${input.label} ${input.buffer}▌`, L.W));
+	} else {
+		const spin = busy ? "⠿ " : "";
+		const text = fit(` ${spin}${status.text}`, L.W);
+		rows[L.H - 1] = status.color ? fg(status.color, text) : dim(text);
+	}
 
 	let frame = "\x1b[?2026h";
 	rows.forEach((row, i) => {
@@ -373,6 +395,7 @@ async function loadIssues(quiet = false) {
 		[repo, issues] = await Promise.all([repo ? repo : gh.repoName(repoCwd), gh.listIssues(repoCwd)]);
 		loaded = true;
 		buildColumns();
+		pruneSelection();
 		ensureVisible();
 		return `${issues.length} open issues · ${new Date().toLocaleTimeString()}`;
 	};
@@ -393,9 +416,17 @@ async function refreshAgents() {
 	} catch {}
 }
 
-function uniqueAgentName(issue: gh.Issue): string {
+/** Discovers the global skills the `/` palette offers; config `skillDirs` replaces the defaults. */
+async function loadSkills() {
+	try {
+		skills = await discoverSkills({ dirs: config.skillDirs, repoCwd });
+		render();
+	} catch {}
+}
+
+/** Agent names must be unique among live agents: `base`, then `base-2`, `base-3`, … */
+function uniqueName(base: string): string {
 	const taken = new Set(agents.map(a => a.name));
-	const base = `issue-${issue.number}`;
 	if (!taken.has(base)) return base;
 	for (let k = 2; ; k++) if (!taken.has(`${base}-${k}`)) return `${base}-${k}`;
 }
@@ -405,15 +436,17 @@ function promptFor(kind: "implement" | "refine", issue: gh.Issue, branch = "") {
 }
 
 /** Starts a named agent in `pane`, sends the prompt, and jumps to it. */
-async function launch(issue: gh.Issue, pane: string, prompt: string): Promise<string> {
+async function launchNamed(base: string, pane: string, prompt: string, where = `in ${pane}`): Promise<string> {
 	agents = await hd.listAgents();
-	const name = uniqueAgentName(issue);
+	const name = uniqueName(base);
 	await hd.startAgent(name, config.agent, pane);
 	await hd.promptAgent(name, prompt);
 	await refreshAgents();
 	await hd.focusAgent(name);
-	return `Started ${name} (${config.agent}) in ${pane}`;
+	return `Started ${name} (${config.agent}) ${where}`;
 }
+
+const launch = (issue: gh.Issue, pane: string, prompt: string) => launchNamed(`issue-${issue.number}`, pane, prompt);
 
 function implementInWorktree(issue: gh.Issue) {
 	return act(`Creating worktree for #${issue.number}`, async () => {
@@ -480,6 +513,7 @@ function issueMenu(issue: gh.Issue): MenuItem[] {
 		{ label: "Implement in new worktree", run: () => implementInWorktree(issue) },
 		{ label: "Implement in split pane", run: () => launchInSplit(issue, "implement") },
 		{ label: "Refine ticket with agent", run: () => launchInSplit(issue, "refine") },
+		{ label: "Slash", submenu: () => slashItems() },
 		{
 			label: "Send to running agent",
 			submenu: async () => {
@@ -517,7 +551,7 @@ function firstEnabled(items: MenuItem[], from = 0, step = 1): number {
 
 function openMenu(issue: gh.Issue, x: number, y: number) {
 	const items = issueMenu(issue);
-	menu = { title: `#${issue.number}`, items, index: firstEnabled(items), x, y, parent: null };
+	menu = { title: `#${issue.number}`, items, index: firstEnabled(items), offset: 0, x, y, parent: null };
 	render();
 }
 
@@ -535,12 +569,280 @@ async function activate(m: Menu, index: number) {
 	if (item.submenu) {
 		const items = await item.submenu();
 		const w = menuRect ? menuRect.x1 - menuRect.x0 + 1 : 0;
-		menu = { title: item.label, items, index: firstEnabled(items), x: m.x + w - 2, y: m.y + index + 1, parent: m };
+		menu = { title: item.label, items, index: firstEnabled(items), offset: 0, x: m.x + w - 2, y: m.y + index + 1, parent: m };
 		return render();
 	}
 	menu = null;
 	render();
 	await item.run?.();
+}
+
+// ── multi-select ────────────────────────────────────────────────────────────
+
+const flatIssues = () => columns.flatMap(c => c.issues);
+
+/** The tickets an action covers: the multi-selection, or (when allowed) every open ticket. */
+function pickedIssues(allowAll: boolean): gh.Issue[] {
+	const all = flatIssues();
+	const picks = selected.size ? all.filter(i => selected.has(i.number)) : allowAll ? all : [];
+	return [...picks].sort((a, b) => a.number - b.number);
+}
+
+function setSelection(numbers: Iterable<number>, note?: string) {
+	selected = new Set(numbers);
+	setStatus(note ?? (selected.size ? `${selected.size} selected · / for slash commands` : "selection cleared"));
+}
+
+/** Drops selected numbers that are no longer open (called after every reload). */
+function pruneSelection() {
+	if (!selected.size) return;
+	const open = new Set(issues.map(i => i.number));
+	const next = new Set([...selected].filter(n => open.has(n)));
+	if (next.size !== selected.size) selected = next;
+}
+
+function toggleSelect(issue: gh.Issue) {
+	const next = new Set(selected);
+	if (next.has(issue.number)) next.delete(issue.number);
+	else next.add(issue.number);
+	setSelection(next);
+}
+
+/** Grows the selection one card at a time through the flattened board order. */
+function extendSelection(dir: 1 | -1) {
+	const flat = flatIssues();
+	if (!flat.length) return;
+	const indexOf = (n: number) => flat.findIndex(i => i.number === n);
+	const edge = selected.size ? (dir === 1 ? Math.max(...[...selected].map(indexOf)) : Math.min(...[...selected].map(indexOf))) : indexOf(selectedIssue()?.number ?? -1);
+	const target = clamp((edge < 0 ? indexOf(selectedIssue()?.number ?? -1) : edge) + dir, 0, flat.length - 1);
+	const issue = flat[target];
+	selCol = columns.findIndex(c => c.issues.includes(issue));
+	selRow = columns[selCol].issues.indexOf(issue);
+	ensureVisible();
+	const next = new Set(selected);
+	next.add(issue.number);
+	setSelection(next);
+}
+
+/** Toggles every card in the focused column. */
+function selectColumn() {
+	const col = columns[selCol];
+	if (!col) return;
+	const next = new Set(selected);
+	const all = col.issues.length > 0 && col.issues.every(i => next.has(i.number));
+	for (const i of col.issues) {
+		if (all) next.delete(i.number);
+		else next.add(i.number);
+	}
+	setSelection(next, `${next.size} selected`);
+}
+
+function openSelectPrompt() {
+	input = {
+		label: "#183-192, 183,185, label:bug, @user, all, none ─",
+		buffer: "",
+		apply: text => {
+			const { numbers, note } = parseSelectionSpec(text, flatIssues());
+			setSelection(numbers, note);
+		},
+	};
+	render();
+}
+
+// ── slash commands: local report, then global skills ────────────────────────
+
+function slashItems(): MenuItem[] {
+	return [
+		{ label: "/report · local summary of the selection", run: () => openReport(undefined) },
+		{ label: "/select · pick tickets by range, label or assignee", run: () => openSelectPrompt() },
+		{ label: "/attach · post prototype screenshots on the tickets", run: () => attachPrototype() },
+		{ label: `${skills.length} global skills`, disabled: true },
+		...skills.map(s => ({
+			label: `/${s.name}${s.description ? ` · ${truncate(s.description, 44)}` : ""}`,
+			run: () => runSkill(s),
+		})),
+	];
+}
+
+function openSlashPalette(x = 2, y = BODY_TOP) {
+	const items = slashItems();
+	menu = { title: "/slash", items, index: firstEnabled(items), offset: 0, x, y, parent: null };
+	render();
+}
+
+function openReport(skill?: Skill) {
+	const picks = pickedIssues(true);
+	reportView = {
+		blocks: buildReport({ repo, issues: picks, total: issues.length, columns: config.columns, skill }),
+		scroll: 0,
+		skill,
+		issues: picks,
+		repo,
+	};
+	menu = null;
+	render();
+	if (!selected.size) setStatus(`Nothing selected — reporting all ${picks.length} open tickets`, null);
+}
+
+function reportLines(blocks: Block[], w: number): string[] {
+	const out: string[] = [];
+	for (const b of blocks) {
+		switch (b.kind) {
+			case "title":
+				out.push(...wrap(b.text, w).map(bold));
+				break;
+			case "meta":
+				out.push(...wrap(b.text, w).map(dim));
+				break;
+			case "rule":
+				out.push(dim("─".repeat(Math.max(1, w))));
+				break;
+			case "heading":
+				if (out.length) out.push("");
+				out.push(bold(fg(CYAN, b.text)));
+				break;
+			case "kv": {
+				const lines = wrap(`${b.key}: ${b.value}`, w);
+				out.push(...lines.map((l, i) => (i === 0 ? bold(`${b.key}:`) + l.slice(b.key.length + 1) : l)));
+				break;
+			}
+			case "ticket":
+				out.push(...wrap(b.text, w).map(bold));
+				out.push(...wrap(b.meta, w).map(dim));
+				break;
+			case "text":
+				out.push(...wrap(b.text, w));
+				break;
+		}
+	}
+	return out;
+}
+
+function renderReport(L: Layout, rows: string[]) {
+	const r = reportView as NonNullable<typeof reportView>;
+	const { W, bodyH } = L;
+	const right = "/ switch skill · e export · y copy · a agent · esc back";
+	rows[0] = headerLine(W, ` ${r.skill ? `Report · /${r.skill.name}` : "Report · quick summary"} · ${r.issues.length} tickets`, right);
+	rows[1] = dim(fit(` ${r.repo} · ${r.issues.map(i => `#${i.number}`).join(" ")}`, W));
+	rows[2] = dim("─".repeat(W));
+	const lines = reportLines(r.blocks, W - 2);
+	r.scroll = clamp(r.scroll, 0, Math.max(0, lines.length - bodyH));
+	for (let y = 0; y < bodyH; y++) rows[BODY_TOP + y] = ` ${lines[r.scroll + y] ?? ""}`;
+}
+
+function exportReport() {
+	const r = reportView;
+	if (!r) return;
+	return act("Exporting report", async () => {
+		const file = join(repoCwd, `issue-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.md`);
+		await Bun.write(file, blocksToMarkdown(r.blocks));
+		return `Wrote ${file}`;
+	});
+}
+
+function copyReport() {
+	const r = reportView;
+	if (!r) return;
+	return act("Copying report", async () => {
+		await copyToClipboard(blocksToMarkdown(r.blocks));
+		return `Copied ${r.issues.length} tickets to the clipboard`;
+	});
+}
+
+/** `a` in the report view: hand the report prompt to a new or running agent. */
+function openReportAgentMenu() {
+	const r = reportView;
+	if (!r) return;
+	const text = reportPrompt(r.repo, r.issues, r.skill);
+	const items: MenuItem[] = [
+		{ label: "New agent in split pane", run: () => reportInSplit(text) },
+		{
+			label: "Send to running agent",
+			submenu: async () => {
+				const live = await hd.listAgents();
+				if (!live.length) return [{ label: "No running agents", disabled: true }];
+				live.sort((a, b) => Number(b.cwd.startsWith(repoCwd)) - Number(a.cwd.startsWith(repoCwd)));
+				return live.map(a => ({
+					label: `${a.target} · ${a.kind} · ${a.status}${a.title ? ` · ${truncate(a.title, 36)}` : ""}`,
+					disabled: a.status === "blocked",
+					run: () =>
+						act(`Sending report to ${a.target}`, async () => {
+							await hd.promptAgent(a.target, text);
+							return `Sent the report prompt to ${a.target}`;
+						}),
+				}));
+			},
+		},
+	];
+	menu = { title: "Send report", items, index: 0, offset: 0, x: 2, y: BODY_TOP, parent: null };
+	render();
+}
+
+function reportInSplit(text: string) {
+	return act("Starting agent for the report", async () => {
+		if (!originPane) throw new Error("no origin pane to split (open the board via its action)");
+		const pane = await hd.splitPane(originPane, repoCwd);
+		return launchNamed("issue-report", pane, text);
+	});
+}
+
+// ── skills: run in a fresh worktree, then publish the prototype back ────────
+
+/** Branch + prompt variables for a `/{skill}` run over the current selection. */
+function skillVars(skill: Skill) {
+	const picks = pickedIssues(false);
+	const numbers = picks.map(i => i.number);
+	const range = rangeLabel(numbers);
+	return {
+		picks,
+		numbers,
+		range,
+		branch: `${config.prototype.branchPrefix}${range}-${slug(skill.name)}`,
+		list: picks.map(i => `- #${i.number} ${i.title} (${i.url})`).join("\n"),
+	};
+}
+
+/** `/{skill}`: fresh worktree for the selected tickets, agent started with the skill prompt. */
+function runSkill(skill: Skill) {
+	const { picks, numbers, range, branch, list } = skillVars(skill);
+	if (!picks.length) return setStatus("Select tickets first (space or /select), then run a slash command", YELLOW);
+	return act(`Running /${skill.name} on ${numbers.length} tickets`, async () => {
+		const pane = await hd.createWorktree(repoCwd, branch, `#${range} ${skill.name}`);
+		const prompt = fill(config.prompts.skill, {
+			skill: skill.name,
+			skillPath: skill.path,
+			count: numbers.length,
+			repo,
+			tickets: numbers.map(n => `#${n}`).join(", "),
+			list,
+			branch,
+			range,
+			extra: skill.name === config.prototype.skill ? config.prompts.prototypeExtra : "",
+		});
+		const base = `${slug(skill.name)}-${range}`.slice(0, 31).replace(/-$/, "");
+		return launchNamed(base, pane, prompt, `on ${branch}`);
+	});
+}
+
+/** `/attach`: publish the prototype worktree's artefacts and comment them onto the tickets. */
+function attachPrototype() {
+	const picks = pickedIssues(false);
+	if (!picks.length) return setStatus("Select the tickets the prototype was generated for", YELLOW);
+	const numbers = picks.map(i => i.number);
+	const range = rangeLabel(numbers);
+	return act(`Attaching prototype to ${numbers.length} tickets`, async () => {
+		const trees = await proto.listWorktrees(repoCwd);
+		const wt = proto.pickPrototypeWorktree(trees, config.prototype.branchPrefix, range);
+		if (!wt) throw new Error(`no worktree on a "${config.prototype.branchPrefix}" branch in this repo`);
+		const artifacts = await proto.findArtifacts(join(wt.path, config.prototype.dir), config.prototype.artifactGlobs);
+		if (!artifacts.length) throw new Error(`no artefacts under ${config.prototype.dir}/ in ${wt.path}`);
+		await proto.publishArtifacts(wt, artifacts.map(a => a.rel), `prototype: #${range} artefacts`);
+		const repoTarget = await gh.repoName(repoCwd);
+		const skill = reportView?.skill?.name ?? wt.branch.replace(/^.*\//, "").replace(`${range}-`, "");
+		await proto.commentOnIssues(repoCwd, numbers, proto.artifactComment({ branch: wt.branch, repo: repoTarget, skill, numbers, artifacts }));
+		const shots = artifacts.filter(a => a.image).length;
+		return `Commented on ${numbers.length} tickets (${wt.branch}, ${shots} screenshots)`;
+	});
 }
 
 // ── input ───────────────────────────────────────────────────────────────────
@@ -561,12 +863,39 @@ function moveSel(dc: number, dr: number) {
 
 function onKey(key: string) {
 	if (key === "ctrl-c") return quit();
+	if (input) {
+		const p = input;
+		if (key === "esc") input = null;
+		else if (key === "enter") {
+			input = null;
+			p.apply(p.buffer);
+			return;
+		} else if (key === "backspace") p.buffer = p.buffer.slice(0, -1);
+		else if (key.length === 1 && key >= " ") p.buffer += key;
+		return render();
+	}
 	if (menu) {
 		const m = menu;
 		if (key === "up" || key === "k") m.index = firstEnabled(m.items, m.index - 1, -1);
 		else if (key === "down" || key === "j") m.index = firstEnabled(m.items, m.index + 1, 1);
 		else if (key === "enter" || key === "right" || key === "l" || key === " ") return void activate(m, m.index);
 		else if (key === "esc" || key === "left" || key === "h" || key === "q") menu = m.parent;
+		return render();
+	}
+	if (reportView) {
+		const r = reportView;
+		const page = Math.max(1, layout().bodyH - 2);
+		if (key === "esc" || key === "q" || key === "backspace" || key === "h" || key === "left") reportView = null;
+		else if (key === "down" || key === "j") r.scroll++;
+		else if (key === "up" || key === "k") r.scroll--;
+		else if (key === "pgdn" || key === " ") r.scroll += page;
+		else if (key === "pgup") r.scroll -= page;
+		else if (key === "g" || key === "home") r.scroll = 0;
+		else if (key === "G" || key === "end") r.scroll = Number.MAX_SAFE_INTEGER;
+		else if (key === "/") return openSlashPalette();
+		else if (key === "e") return void exportReport();
+		else if (key === "y") return void copyReport();
+		else if (key === "a" || key === "m" || key === ".") return openReportAgentMenu();
 		return render();
 	}
 	if (detail) {
@@ -614,9 +943,23 @@ function onKey(key: string) {
 			return void loadIssues();
 		case "enter":
 			return issue && openDetail(issue);
+		case " ":
+		case "x":
+			return issue && toggleSelect(issue);
+		case "J":
+			return extendSelection(1);
+		case "K":
+			return extendSelection(-1);
+		case "A":
+			return selectColumn();
+		case "c":
+			return setSelection([]);
+		case "S":
+			return openSelectPrompt();
+		case "/":
+			return openSlashPalette();
 		case "m":
 		case ".":
-		case " ":
 			return openMenuAtSelection();
 		case "o":
 			return issue && void openBrowser(issue);
@@ -633,7 +976,14 @@ function onMouse(button: number, x: number, y: number) {
 	const btn = button & 3;
 
 	if (wheel) {
-		if (menu) return;
+		if (menu) {
+			menu.index = firstEnabled(menu.items, menu.index + wheel, wheel > 0 ? 1 : -1);
+			return render();
+		}
+		if (reportView) {
+			reportView.scroll += wheel * 3;
+			return render();
+		}
 		if (detail) {
 			detail.scroll += wheel * 3;
 			return render();
@@ -658,6 +1008,7 @@ function onMouse(button: number, x: number, y: number) {
 		if (btn !== 2) return render();
 	}
 
+	if (reportView) return;
 	if (detail) {
 		if (btn === 2) openMenu(detail.issue, x, y);
 		return;
@@ -732,5 +1083,6 @@ process.on("SIGHUP", quit);
 render();
 void loadIssues();
 void refreshAgents();
+void loadSkills();
 setInterval(refreshAgents, 3000);
 setInterval(() => void loadIssues(true), 120_000);

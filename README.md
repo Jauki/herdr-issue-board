@@ -1,0 +1,127 @@
+# Issue Board — a herdr plugin
+
+A Kanban board of the focused repo's open GitHub issues, rendered as a full-screen TUI inside a
+[herdr](https://herdr.dev) pane. Triage by moving tickets between label-backed columns, hand a single
+ticket to a coding agent, or multi-select a batch and drive agent **skills** from a `/` palette —
+including a prototype hand-off that posts screenshots back onto the tickets.
+
+```
+┌ herdr-issue-board · 34 open · 6 selected ─ space select · J/K extend · / slash · m actions ┐
+│ Needs triage (5)  │ Needs info (2)    │ Ready for agent (9) │ Ready for human (3)        │
+│ ▌#183 Board…      │  #188 Untriaged…  │  #185 Prototype…    │  #186 Screenshot…          │
+└ ⠿ 6 selected · / for slash commands ───────────────────────────────────────────────────────┘
+```
+
+## Install
+
+Needs `herdr >= 0.9.0`, [`bun`](https://bun.sh) and an authenticated [`gh`](https://cli.github.com).
+
+```sh
+git clone https://github.com/Jauki/herdr-issue-board.git
+herdr plugin link ./herdr-issue-board
+```
+
+Bind a key in `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+i"
+type = "plugin_action"
+command = "jauki.issue-board.open"
+description = "issue board"
+```
+
+The board opens as an overlay pane for the repo of the pane that had focus.
+
+## Board keys
+
+| key | action |
+| --- | --- |
+| `←` `→` `↑` `↓` / `h` `j` `k` `l` | move the cursor (`pgup`/`pgdn`, `g`/`G` jump) |
+| `space`, `x` | toggle the card in the multi-selection |
+| `J`, `K` | grow the selection forward/backward, one card at a time |
+| `A` | select (or unselect) every card in the focused column |
+| `c` | clear the selection |
+| `S` | type a selection spec: `183-192`, `183,185`, `label:bug`, `@user`, `all`, `none` |
+| `/` | open the slash palette (`/report`, `/select`, `/attach`, then one entry per global skill) |
+| `⏎` | ticket detail (body + comments) |
+| `m`, `.`, right-click | action menu: implement in worktree / split pane, refine, slash, send to a running agent, move, browser |
+| `r` | reload issues (also every 2 minutes) |
+| `q` | quit |
+
+Cards show the live agent badge (`◆ working|idle|blocked|done`) for agents the board started for them.
+
+## The `/` palette
+
+`/` lists the global agent skills found on disk — every `SKILL.md` under the dirs in
+`skillDirs` (default `~/.agents/skills`, `~/.claude/skills`, `~/.opencode/skills`, plus the repo's
+own `.agents/skills` and `.claude/skills`). The same list is on a card's `Slash` submenu.
+
+- `/report` — instant local summary of the selection (no agent): per-column/label/assignee counts,
+  staleness, the ticket list and the prompt an agent would get. `e` exports Markdown, `y` copies it,
+  `a` hands the prompt to a new or running agent, `/` switches skill.
+- `/select` — the `S` selection prompt.
+- `/attach` — the prototype hand-off below.
+- `/<skill>` — starts that skill on the **selected tickets**: creates a worktree on
+  `slash/<range>-<skill>`, starts a herdr agent in it and prompts it with the skill, the ticket list
+  and the branch, so the agent keeps every artefact there and leaves `main` alone.
+
+Nothing selected? `/report` summarises all open tickets; `/<skill>` and `/attach` require an explicit
+selection, so a stray keypress can never fan out to the whole backlog.
+
+## Prototype → tickets
+
+The flow this plugin was built around, for a batch like `#183–#192`:
+
+1. Select the tickets (`/select` → `183-192`).
+2. `/prototype` → new worktree, agent runs the Matt Pocock `prototype` skill for those tickets
+   (`prompts.prototypeExtra` tells it to save one full-page PNG per variant under
+   `prototype/screenshots/` and commit it on the branch).
+3. When the prototype is done, select the same tickets on the board and run `/attach`. It picks the
+   `slash/…` worktree for that range, commits and pushes any dirty artefacts, and comments on every
+   ticket with the branch pointer plus the screenshots, so whoever implements the ticket sees exactly
+   what to build.
+
+Screenshots are linked as `raw.githubusercontent.com` URLs, which GitHub's image proxy can only fetch
+from a public repo — on a private repo the comment lands with the branch pointer and file list but the
+inline images stay blank.
+
+## Configuration
+
+`$HERDR_PLUGIN_CONFIG_DIR/config.json` overlays the defaults (`columns` replaces, everything else merges):
+
+```json
+{
+  "agent": "omp",
+  "columns": [
+    { "title": "Needs triage", "label": "needs-triage" },
+    { "title": "Ready for agent", "label": "ready-for-agent" }
+  ],
+  "skillDirs": ["~/.agents/skills"],
+  "prototype": { "skill": "prototype", "branchPrefix": "slash/", "dir": "prototype" },
+  "prompts": {
+    "implement": "Implement GitHub issue #{number} in {repo}: \"{title}\" ({url})."
+  }
+}
+```
+
+Prompt placeholders — `implement`/`refine`: `{number} {title} {repo} {url} {branch}`;
+`skill`: `{skill} {skillPath} {count} {repo} {tickets} {list} {branch} {range} {extra}`.
+
+## Layout
+
+| file | role |
+| --- | --- |
+| `src/board.ts` | the TUI: layout, render, hit-testing, input, actions |
+| `src/config.ts` | config types, defaults, `{placeholder}` filling |
+| `src/report.ts` | report blocks + Markdown export (pure, no TTY) |
+| `src/selection.ts` | selection-spec parsing, range labels |
+| `src/skills.ts` | `SKILL.md` discovery |
+| `src/prototype.ts` | worktree lookup, artefact publish, ticket comments |
+| `src/github.ts` | `gh` wrappers (issues, labels, detail) |
+| `src/herdr.ts` | `herdr` CLI wrappers (panes, worktrees, agents) |
+| `src/proc.ts` | process + clipboard helpers |
+
+## License
+
+MIT
