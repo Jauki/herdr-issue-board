@@ -1,0 +1,7 @@
+{
+  "name": "herdr-issue-board",
+  "private": true,
+  "type": "module",
+  "scripts": { "check": "tsc --noEmit" },
+  "devDependencies": { "@types/bun": "latest", "typescript": "^5.9.0" }
+}

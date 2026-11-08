@@ -1,0 +1,19 @@
+id = "jauki.issue-board"
+name = "Issue Board"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Kanban board of the focused repo's GitHub issues; hand tickets to coding agents"
+platforms = ["linux", "macos"]
+
+# Bind with:  [[keys.command]] key = "prefix+i"  type = "plugin_action"  command = "jauki.issue-board.open"
+[[actions]]
+id = "open"
+title = "Open issue board"
+contexts = ["workspace"]
+command = ["bun", "src/open.ts"]
+
+[[panes]]
+id = "board"
+title = "Issue board"
+placement = "overlay"
+command = ["bun", "src/board.ts"]
