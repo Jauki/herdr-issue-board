@@ -42,12 +42,24 @@ describe("commentOnIssues", () => {
 			calls.push(argv[3]);
 			return "done";
 		});
-		expect(calls.sort()).toEqual(["183", "184", "185"]);
+		expect(calls).toEqual(["183", "184", "185"]);
+	});
+
+	test("sends one comment at a time — GitHub rate-limits concurrent mutations", async () => {
+		let inFlight = 0;
+		let peak = 0;
+		await commentOnIssues("/repo", [1, 2, 3], "body", async () => {
+			peak = Math.max(peak, ++inFlight);
+			await new Promise(resolve => setTimeout(resolve, 5));
+			inFlight--;
+			return "done";
+		});
+		expect(peak).toBe(1);
 	});
 
 	test("partial failure reports succeeded and failed issue numbers honestly", async () => {
 		const runner = ghRunner({ "184": new CommandError("gh: GraphQL: was submitted too quickly") });
-		expect(commentOnIssues("/repo", [183, 184, 185], "body", runner)).rejects.toThrow(
+		await expect(commentOnIssues("/repo", [183, 184, 185], "body", runner)).rejects.toThrow(
 			"commented on #183, #185; failed on #184: gh: GraphQL: was submitted too quickly",
 		);
 	});
@@ -57,7 +69,7 @@ describe("commentOnIssues", () => {
 			"183": new CommandError("gh: not found"),
 			"184": new CommandError("gh: network"),
 		});
-		expect(commentOnIssues("/repo", [183, 184], "body", runner)).rejects.toThrow(
+		await expect(commentOnIssues("/repo", [183, 184], "body", runner)).rejects.toThrow(
 			"failed on #183: gh: not found; failed on #184: gh: network",
 		);
 	});
